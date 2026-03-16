@@ -930,7 +930,7 @@ async def cb_srv_glimit_remove(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "srv_toggle_metrics")
 @admin_only
-async def cb_toggle_metrics(cb: CallbackQuery):
+async def cb_toggle_metrics(cb: CallbackQuery, state: FSMContext):
     server = await OutlineAPI.server_info()
     if not server:
         await cb.answer("❌ Не удалось получить данные сервера", show_alert=True)
@@ -943,7 +943,7 @@ async def cb_toggle_metrics(cb: CallbackQuery):
     else:
         await cb.answer("❌ Ошибка изменения метрик", show_alert=True)
     # Обновляем страницу настроек
-    await cb_server_menu(cb, None)
+    await cb_server_menu(cb, state)
 
 
 # Префикс ссылки (DPI bypass) ─────────────────────────────────────────────────
