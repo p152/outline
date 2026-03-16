@@ -238,6 +238,15 @@ PREFIX_PRESETS: dict[str, tuple[bytes, str]] = {
 }
 
 
+def _full_access_url(key: dict) -> str:
+    """Возвращает accessUrl с именем ключа в #фрагменте (если сервер не вернул его сам)."""
+    url = key.get("accessUrl", "")
+    name = key.get("name")
+    if name and "#" not in url:
+        url = f"{url}#{name}"
+    return url
+
+
 def _make_prefixed_url(access_url: str, prefix_bytes: bytes, keep_name: bool = True) -> str:
     """Вставляет параметр prefix= в ss:// ссылку.
     keep_name=True  → сохраняет #name (клиент показывает имя ключа)
@@ -410,8 +419,8 @@ def fmt_key(key: dict, used_bytes: int | None = None) -> str:
         lines.append(
             f"📤 Использовано: {fmt_bytes(used_bytes)}{fmt_pct(used_bytes, limit_bytes)}"
         )
-    if url := key.get("accessUrl"):
-        lines.append(f"\n🔗 <code>{url}</code>")
+    if key.get("accessUrl"):
+        lines.append(f"\n🔗 <code>{_full_access_url(key)}</code>")
     return "\n".join(lines)
 
 
@@ -996,7 +1005,7 @@ async def cb_prefix_apply(cb: CallbackQuery):
         return
 
     await cb.message.edit_text(
-        _fmt_prefix_result(key["accessUrl"], prefix_bytes, label),
+        _fmt_prefix_result(_full_access_url(key), prefix_bytes, label),
         reply_markup=kb_prefix_menu(key_id),
         parse_mode="HTML",
     )
@@ -1045,7 +1054,7 @@ async def fsm_prefix_custom(msg: Message, state: FSMContext):
         return
 
     await msg.answer(
-        _fmt_prefix_result(key["accessUrl"], prefix_bytes, "custom"),
+        _fmt_prefix_result(_full_access_url(key), prefix_bytes, "custom"),
         parse_mode="HTML",
         reply_markup=kb_key(data["key_id"]),
     )
