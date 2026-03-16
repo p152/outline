@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import ssl
+import urllib.parse
 from datetime import datetime
 from functools import wraps
 from logging.handlers import RotatingFileHandler
@@ -65,6 +67,8 @@ class Config:
         if x.strip().isdigit()
     ]
     CERT_FILE: str = "outline_cert.pem"
+    # Префикс для автоимени при быстром создании ключа. Меняется через бот (до перезапуска).
+    KEY_PREFIX: str = os.getenv("KEY_PREFIX", "Key").strip() or "Key"
 
 
 # ── Outline API ───────────────────────────────────────────────────────────────
@@ -223,6 +227,38 @@ class States(StatesGroup):
     server_hostname = State()
     server_port = State()
     server_global_limit = State()
+    server_prefix = State()
+    prefix_custom = State()
+
+
+# Пресеты префиксов: имитация TLS-заголовка для обхода DPI
+PREFIX_PRESETS: dict[str, tuple[bytes, str]] = {
+    "tls10": (bytes([0x16, 0x03, 0x01, 0x00, 0xC2, 0xA8, 0x01, 0x01]), "TLS 1.0"),
+    "tls12": (bytes([0x16, 0x03, 0x03, 0x00, 0xC2, 0xA8, 0x01, 0x01]), "TLS 1.2"),
+}
+
+
+def _make_prefixed_url(access_url: str, prefix_bytes: bytes, keep_name: bool = True) -> str:
+    """Вставляет параметр prefix= в ss:// ссылку.
+    keep_name=True  → сохраняет #name (клиент показывает имя ключа)
+    keep_name=False → убирает #name (клиент показывает имя сервера по умолчанию)
+    """
+    encoded = urllib.parse.quote(prefix_bytes, safe="")
+    base, _, fragment = access_url.partition("#")
+    sep = "&" if "?" in base else "?"
+    result = f"{base}{sep}prefix={encoded}"
+    return f"{result}#{fragment}" if (keep_name and fragment) else result
+
+
+def _next_autoname(keys: list[dict]) -> str:
+    """Возвращает следующее свободное имя вида 'PREFIX #N', заполняя пропуски."""
+    prefix = Config.KEY_PREFIX
+    pattern = re.compile(rf"^{re.escape(prefix)} #(\d+)$")
+    used = {int(m.group(1)) for k in keys if (m := pattern.match(k.get("name", "")))}
+    n = 1
+    while n in used:
+        n += 1
+    return f"{prefix} #{n}"
 
 
 # ── Access control ────────────────────────────────────────────────────────────
@@ -278,10 +314,25 @@ def kb_key(key_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Лимит", callback_data=f"set_limit:{key_id}"),
         ],
         [
+            InlineKeyboardButton(text="🔀 Префикс ссылки", callback_data=f"prefix_menu:{key_id}"),
+        ],
+        [
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"confirm_del:{key_id}"),
             InlineKeyboardButton(text="🔙 Список", callback_data="list_keys"),
         ],
     ])
+
+
+def kb_prefix_menu(key_id: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"🔵 {label}",
+            callback_data=f"pfx:{key_id}:{preset}",
+        ) for preset, (_, label) in PREFIX_PRESETS.items()],
+        [InlineKeyboardButton(text="✏️ Свои байты (hex)", callback_data=f"pfx_custom:{key_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"key:{key_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_confirm_del(key_id: str) -> InlineKeyboardMarkup:
@@ -304,6 +355,7 @@ def kb_server(metrics_enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🌐 Изменить hostname", callback_data="srv_hostname")],
         [InlineKeyboardButton(text="🚪 Порт для новых ключей", callback_data="srv_port")],
         [InlineKeyboardButton(text="🌍 Глобальный лимит", callback_data="srv_global_limit")],
+        [InlineKeyboardButton(text=f"🏷 Префикс ключей: {Config.KEY_PREFIX}", callback_data="srv_prefix")],
         [InlineKeyboardButton(text=metrics_label, callback_data="srv_toggle_metrics")],
         [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")],
     ])
@@ -458,7 +510,11 @@ async def cb_create_menu(cb: CallbackQuery):
 @dp.callback_query(F.data == "create_quick")
 @admin_only
 async def cb_create_quick(cb: CallbackQuery):
-    key = await OutlineAPI.create_key()
+    existing = await OutlineAPI.list_keys()
+    existing_list = existing.get("accessKeys", []) if existing else []
+    auto_name = _next_autoname(existing_list)
+
+    key = await OutlineAPI.create_key(name=auto_name)
     if not key or "id" not in key:
         await cb.message.edit_text("❌ Ошибка создания ключа", reply_markup=kb_back())
         await cb.answer()
@@ -702,6 +758,7 @@ async def cb_server_menu(cb: CallbackQuery, state: FSMContext):
         f"🚪 Порт новых ключей: <code>{server.get('portForNewAccessKeys', 'N/A')}</code>",
         f"🌍 Глобальный лимит: {fmt_bytes(global_limit['bytes']) if global_limit else '♾️ нет'}",
         f"📶 Метрики: {'🟢 включены' if metrics_enabled else '🔴 выключены'}",
+        f"🏷 Префикс ключей: <code>{Config.KEY_PREFIX}</code>",
     ]
 
     await cb.message.edit_text(
@@ -878,6 +935,156 @@ async def cb_toggle_metrics(cb: CallbackQuery):
         await cb.answer("❌ Ошибка изменения метрик", show_alert=True)
     # Обновляем страницу настроек
     await cb_server_menu(cb, None)
+
+
+# Префикс ссылки (DPI bypass) ─────────────────────────────────────────────────
+
+def _fmt_prefix_result(access_url: str, prefix_bytes: bytes, label: str) -> str:
+    """Формирует сообщение с двумя вариантами ссылки: с именем и без."""
+    url_named = _make_prefixed_url(access_url, prefix_bytes, keep_name=True)
+    url_clean = _make_prefixed_url(access_url, prefix_bytes, keep_name=False)
+    hex_str = prefix_bytes.hex().upper()
+
+    lines = [f"🔀 <b>Ссылка с DPI-префиксом {label}</b>", ""]
+
+    # Показываем ссылку без имени только если оригинал содержал имя
+    if url_named != url_clean:
+        lines += [
+            "👤 <b>Для клиента — без имени ключа</b>",
+            f"(клиент покажет имя сервера по умолчанию)",
+            f"<code>{url_clean}</code>",
+            "",
+            "🏷 <b>С именем ключа</b>",
+            f"<code>{url_named}</code>",
+        ]
+    else:
+        lines += [
+            "🔗 <b>Ссылка:</b>",
+            f"<code>{url_clean}</code>",
+        ]
+
+    lines += ["", f"🔬 Байты: <code>{hex_str}</code>"]
+    return "\n".join(lines)
+
+@dp.callback_query(F.data.startswith("prefix_menu:"))
+@admin_only
+async def cb_prefix_menu(cb: CallbackQuery):
+    key_id = cb.data.split(":", 1)[1]
+    await cb.message.edit_text(
+        "🔀 <b>Префикс ссылки</b>\n\n"
+        "Добавляет байты в начало TCP-соединения, маскируя трафик под TLS.\n"
+        "Работает с Outline Client 1.x+\n\n"
+        "Выберите пресет или введите байты вручную:",
+        reply_markup=kb_prefix_menu(key_id),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("pfx:"))
+@admin_only
+async def cb_prefix_apply(cb: CallbackQuery):
+    _, key_id, preset = cb.data.split(":", 2)
+    if preset not in PREFIX_PRESETS:
+        await cb.answer("❌ Неизвестный пресет", show_alert=True)
+        return
+
+    prefix_bytes, label = PREFIX_PRESETS[preset]
+    key = await OutlineAPI.get_key(key_id)
+    if not key or not key.get("accessUrl"):
+        await cb.answer("❌ Не удалось получить ключ", show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        _fmt_prefix_result(key["accessUrl"], prefix_bytes, label),
+        reply_markup=kb_prefix_menu(key_id),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("pfx_custom:"))
+@admin_only
+async def cb_prefix_custom(cb: CallbackQuery, state: FSMContext):
+    key_id = cb.data.split(":", 1)[1]
+    await state.set_state(States.prefix_custom)
+    await state.update_data(key_id=key_id)
+    await cb.message.edit_text(
+        "✏️ Введите байты префикса в <b>hex-формате</b>:\n\n"
+        "Примеры:\n"
+        "• <code>160301</code> — TLS Record header\n"
+        "• <code>474554202F20485454502F312E310D0A0D0A</code> — HTTP GET\n\n"
+        "Пробелы и двоеточия между байтами допустимы: <code>16 03 01</code>",
+        parse_mode="HTML",
+        reply_markup=kb_cancel(f"prefix_menu:{key_id}"),
+    )
+    await cb.answer()
+
+
+@dp.message(States.prefix_custom)
+@admin_only
+async def fsm_prefix_custom(msg: Message, state: FSMContext):
+    hex_str = msg.text.strip().replace(" ", "").replace(":", "").replace("-", "")
+    try:
+        prefix_bytes = bytes.fromhex(hex_str)
+        if not prefix_bytes:
+            raise ValueError
+    except ValueError:
+        await msg.answer(
+            "❌ Неверный hex. Пример: <code>16 03 01 00</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    key = await OutlineAPI.get_key(data["key_id"])
+    if not key or not key.get("accessUrl"):
+        await msg.answer("❌ Не удалось получить ключ", reply_markup=kb_main())
+        return
+
+    await msg.answer(
+        _fmt_prefix_result(key["accessUrl"], prefix_bytes, "custom"),
+        parse_mode="HTML",
+        reply_markup=kb_key(data["key_id"]),
+    )
+
+
+# Префикс автоимени ───────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "srv_prefix")
+@admin_only
+async def cb_srv_prefix(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(States.server_prefix)
+    await cb.message.edit_text(
+        f"🏷 Текущий префикс: <code>{Config.KEY_PREFIX}</code>\n\n"
+        "Введите новый префикс для быстрого создания ключей.\n"
+        "Ключи будут называться: <code>ПРЕФИКС #1</code>, <code>ПРЕФИКС #2</code> и т.д.",
+        parse_mode="HTML",
+        reply_markup=kb_cancel("server_menu"),
+    )
+    await cb.answer()
+
+
+@dp.message(States.server_prefix)
+@admin_only
+async def fsm_server_prefix(msg: Message, state: FSMContext):
+    prefix = msg.text.strip()
+    if not prefix:
+        await msg.answer("❌ Префикс не может быть пустым")
+        return
+    if len(prefix) > 32:
+        await msg.answer("❌ Префикс не может быть длиннее 32 символов")
+        return
+    await state.clear()
+    Config.KEY_PREFIX = prefix
+    await msg.answer(
+        f"✅ Префикс изменён на <code>{prefix}</code>\n"
+        f"Следующий быстрый ключ получит имя: <code>{prefix} #1</code>",
+        parse_mode="HTML",
+        reply_markup=kb_main(),
+    )
 
 
 # ── Global error handler ──────────────────────────────────────────────────────
