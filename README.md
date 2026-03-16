@@ -41,8 +41,8 @@ Telegram-бот для управления сервером [Outline VPN](https
 ### 1. Клонировать репозиторий
 
 ```bash
-git clone https://github.com/p152/outline-vpn-bot.git
-cd outline-vpn-bot
+git clone https://github.com/p152/outline.git
+cd outline
 ```
 
 ### 2. Создать виртуальное окружение и установить зависимости
