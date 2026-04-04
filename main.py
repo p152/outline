@@ -69,7 +69,8 @@ class Config:
         for x in _require("ALLOWED_IDS").split(",")
         if x.strip().isdigit()
     ]
-    CERT_FILE: str = "outline_cert.pem"
+    # PEM для проверки TLS Management API (путь относительно каталога запуска бота)
+    CERT_FILE: str = os.getenv("OUTLINE_CERT", "outline_cert.pem").strip() or "outline_cert.pem"
     KEY_PREFIX: str = os.getenv("KEY_PREFIX", "Key").strip() or "Key"
 
 
@@ -206,6 +207,8 @@ class ServerRegistry:
     def __init__(self):
         self._servers: dict[str, dict] = {}
         self._apis: dict[str, OutlineAPI] = {}
+        # (url, resolved_cert_path) — чтобы пересоздать клиент после правки servers.json
+        self._api_meta: dict[str, tuple[str, str]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -253,6 +256,7 @@ class ServerRegistry:
         del self._servers[srv_id]
         if srv_id in self._apis:
             del self._apis[srv_id]
+        self._api_meta.pop(srv_id, None)
         self._save()
         logger.info("Удалён сервер: %s (%s)", name, srv_id)
         return True
@@ -266,15 +270,31 @@ class ServerRegistry:
     def get_api(self, srv_id: str) -> Optional[OutlineAPI]:
         if srv_id not in self._servers:
             return None
-        if srv_id not in self._apis:
-            s = self._servers[srv_id]
-            self._apis[srv_id] = OutlineAPI(s["url"])
+        s = self._servers[srv_id]
+        cert_opt = (s.get("cert") or "").strip()
+        resolved_cert = cert_opt or Config.CERT_FILE
+        want_meta = (s["url"].rstrip("/"), resolved_cert)
+        if srv_id in self._apis and self._api_meta.get(srv_id) == want_meta:
+            return self._apis[srv_id]
+        if srv_id in self._apis:
+            old = self._apis.pop(srv_id)
+            self._api_meta.pop(srv_id, None)
+            try:
+                asyncio.get_running_loop().create_task(old.close())
+            except RuntimeError:
+                pass
+        self._apis[srv_id] = OutlineAPI(
+            s["url"],
+            cert_file=cert_opt if cert_opt else None,
+        )
+        self._api_meta[srv_id] = want_meta
         return self._apis[srv_id]
 
     async def stop_all(self) -> None:
         for api in self._apis.values():
             await api.close()
         self._apis.clear()
+        self._api_meta.clear()
 
 
 registry = ServerRegistry()

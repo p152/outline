@@ -6,5 +6,8 @@ __pycache__/
 .venv/
 venv/
 outline_cert.pem
+servers.json
+# PEM для нескольких серверов (не коммитить)
+certs/*.pem
 bot.log
 .vscode/

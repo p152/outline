@@ -1,10 +1,16 @@
 # 🔐 Outline VPN Manager Bot
 
-Telegram-бот для управления сервером [Outline VPN](https://getoutline.org/) через Management API. Позволяет создавать, удалять и настраивать ключи доступа, следить за трафиком и управлять настройками сервера — прямо из Telegram.
+Telegram-бот для управления одним или несколькими серверами [Outline VPN](https://getoutline.org/) через Management API. Позволяет создавать, удалять и настраивать ключи доступа, следить за трафиком и управлять настройками сервера — прямо из Telegram.
 
 ---
 
 ## ✨ Возможности
+
+### Несколько серверов
+- 🖥 Список серверов при старте и кнопка **«Сменить сервер»**
+- ➕ Добавление сервера по URL Management API прямо в боте
+- 🗑 Удаление записи о сервере из бота (сами ключи на Outline не трогаются)
+- 📁 Конфигурация серверов хранится в `servers.json` (не коммитится в git)
 
 ### Управление ключами
 - 📋 Просмотр списка всех ключей
@@ -14,6 +20,7 @@ Telegram-бот для управления сервером [Outline VPN](https
 - 📤 Просмотр использованного трафика с процентом от лимита
 - 🗑 Удаление с подтверждением
 - 🔗 Ключ доступа `ss://...` прямо в карточке
+- 🔀 Пресеты и свой hex-префикс ссылки (DPI bypass)
 
 ### Статистика
 - 📶 Трафик по всем ключам с именами (сортировка по убыванию)
@@ -28,11 +35,40 @@ Telegram-бот для управления сервером [Outline VPN](https
 - 🚪 Изменение порта для новых ключей
 - 🌍 Глобальный лимит для всех ключей (пресеты 1/5/10/50 GB или своё значение)
 - 📶 Включение / выключение сбора метрик
+- 🏷 Префикс имён при быстром создании ключей
 
 ### Безопасность
 - 🔒 Доступ только для указанных Telegram ID
-- 🔑 SSL certificate pinning — проверка по `outline_cert.pem`
-- 📁 `.env` и логи защищены `.gitignore`
+- 🔑 Проверка TLS по PEM-сертификату (pinning)
+- 📁 `.env`, `servers.json`, логи и PEM в `.gitignore`
+
+---
+
+## 📄 Файл `servers.json` — когда появляется
+
+Файл **создаётся автоматически**, вы вручную его не обязаны заводить:
+
+1. **Первый запуск бота**, если есть `OUTLINE_API_URL` в `.env`, а `servers.json` ещё нет — бот **мигрирует** этот URL в одну запись в `servers.json` (имя по умолчанию «Outline Server»).
+2. **Добавление сервера в боте** («➕ Добавить сервер») — если файла не было, он будет **создан** при сохранении первого сервера.
+
+Если ни `OUTLINE_API_URL`, ни серверов в боте нет — `servers.json` не появится, пока вы не добавите сервер через интерфейс или не скопируете готовый файл.
+
+Формат записи (для справки; про поле `cert` см. ниже):
+
+```json
+{
+  "servers": [
+    {
+      "id": "default",
+      "name": "Мой VPS",
+      "url": "https://IP:PORT/SECRET_PATH",
+      "cert": "certs/server1.pem"
+    }
+  ]
+}
+```
+
+Поле `"cert"` **необязательно**: если его нет, используется глобальный путь из `OUTLINE_CERT` или `outline_cert.pem`.
 
 ---
 
@@ -76,23 +112,35 @@ ALLOWED_IDS=123456789
 | Переменная | Где взять |
 |---|---|
 | `BOT_TOKEN` | [@BotFather](https://t.me/BotFather) → `/newbot` |
-| `OUTLINE_API_URL` | Outline Manager → Настройки → *URL для доступа к Management API* |
+| `OUTLINE_API_URL` | Опционально после миграции в `servers.json`; удобен для **первого** запуска и для скрипта сертификата |
 | `ALLOWED_IDS` | [@userinfobot](https://t.me/userinfobot) — покажет ваш ID |
+| `OUTLINE_CERT` | (опционально) путь к PEM по умолчанию, если не задано — `outline_cert.pem` |
+| `KEY_PREFIX` | (опционально) префикс имён быстрых ключей |
 
-### 4. Получить SSL-сертификат сервера
+### 4. Получить SSL-сертификат Management API
 
-Outline использует самоподписанный сертификат. Нужно его загрузить один раз:
+Outline отдаёт API по HTTPS с **самоподписанным** сертификатом. Чтобы бот проверял TLS, сохраните его PEM на машину с ботом.
+
+**Рекомендуемый способ** — скрипт из репозитория (из корня проекта, venv активирован):
 
 ```bash
-python -c "
-import ssl
-cert = ssl.get_server_certificate(('YOUR_SERVER_IP', YOUR_PORT))
-open('outline_cert.pem', 'w').write(cert)
-print('Сертификат сохранён')
-"
+# URL из Outline Manager или как в OUTLINE_API_URL
+python scripts/fetch_outline_cert.py --url "https://YOUR_SERVER_IP:PORT/YOUR_SECRET_PATH"
+
+# или взять URL из .env автоматически
+python scripts/fetch_outline_cert.py --from-env
 ```
 
-> Замените `YOUR_SERVER_IP` и `YOUR_PORT` на IP и порт из `OUTLINE_API_URL`.
+По умолчанию создаётся файл `outline_cert.pem` в **текущей рабочей директории**. Запускайте бот и скрипт из одного каталога (обычно корень проекта) или укажите путь явно:
+
+```bash
+python scripts/fetch_outline_cert.py --from-env -o outline_cert.pem
+python scripts/fetch_outline_cert.py -u "https://..." -o certs/second.pem
+```
+
+Для **нескольких** Outline-серверов у каждого свой сертификат: сохраните разные PEM (например `certs/nl.pem`, `certs/de.pem`) и пропишите путь в поле `"cert"` соответствующей записи в `servers.json`. Общий файл по умолчанию задаётся через `OUTLINE_CERT` в `.env`.
+
+Если PEM нет, бот всё равно запустится, но в логе будет предупреждение, что проверка TLS отключена.
 
 ### 5. Запустить бота
 
@@ -100,42 +148,43 @@ print('Сертификат сохранён')
 python main.py
 ```
 
+После первого запуска с заданным `OUTLINE_API_URL` проверьте наличие `servers.json` — дальше список серверов можно вести через бота.
+
 ---
 
 ## 📁 Структура проекта
 
 ```
-outline-vpn-bot/
-├── main.py              # Основной файл бота
-├── requirements.txt     # Зависимости
-├── .env                 # Конфигурация (не хранить в git)
-├── .env.example         # Шаблон конфигурации
+outline/
+├── main.py                      # Точка входа бота
+├── scripts/
+│   └── fetch_outline_cert.py   # Скачивание PEM с хоста Management API
+├── requirements.txt
+├── .env                         # Секреты (не в git)
+├── .env.example
 ├── .gitignore
-├── outline_cert.pem     # SSL-сертификат Outline-сервера
-└── bot.log              # Лог (ротация 5 MB × 3 файла)
+├── servers.json                 # Список серверов (создаётся ботом, не в git)
+├── outline_cert.pem             # PEM по умолчанию (не в git)
+├── certs/                       # Опционально: PEM на каждый сервер (*.pem не в git)
+└── bot.log                      # Лог (ротация 5 MB × 3 файла)
 ```
 
 ---
 
 ## ⚙️ Как работает SSL
 
-Outline Manager использует **certificate pinning**: вместо проверки hostname проверяется, что сервер предъявляет именно тот сертификат, который был загружен при настройке. Это защищает от MITM-атак с подменой сертификата, даже несмотря на то, что сертификат самоподписанный.
+Outline Manager использует проверку по загруженному сертификату: клиент убеждается, что сервер предъявляет тот же PEM, что вы сохранили. Это снижает риск MITM при самоподписанном сертификате.
 
-При обновлении сервера (переустановка Outline) сертификат меняется — нужно повторно выполнить шаг 4.
+После переустановки Outline или смены сертификата на сервере выполните скрипт снова и перезапишите соответствующий PEM.
 
 ---
 
 ## 🔄 Обновление сертификата
 
-Если бот перестал подключаться к API после обновления сервера:
-
 ```bash
-python -c "
-import ssl
-cert = ssl.get_server_certificate(('YOUR_SERVER_IP', YOUR_PORT))
-open('outline_cert.pem', 'w').write(cert)
-print('Сертификат обновлён')
-"
+python scripts/fetch_outline_cert.py --from-env -o outline_cert.pem
+# или
+python scripts/fetch_outline_cert.py -u "https://IP:PORT/SECRET" -o outline_cert.pem
 ```
 
 ---
@@ -147,6 +196,8 @@ print('Сертификат обновлён')
 | [aiogram](https://github.com/aiogram/aiogram) | ≥ 3.7 | Telegram Bot API |
 | [aiohttp](https://github.com/aio-libs/aiohttp) | ≥ 3.9 | Async HTTP-клиент для Outline API |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | ≥ 1.0 | Загрузка `.env` |
+
+Скрипт `fetch_outline_cert.py` с флагом `--from-env` использует тот же `python-dotenv` из `requirements.txt`.
 
 ---
 
