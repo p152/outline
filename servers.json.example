@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "id": "default",
+      "name": "RU",
+      "url": "https://YOUR_HOST:PORT/YOUR_SECRET",
+      "cert": "certs/ru.pem"
+    },
+    {
+      "id": "57df1c57",
+      "name": "NL",
+      "url": "https://YOUR_HOST2:PORT2/YOUR_SECRET2",
+      "cert": "certs/nl.pem"
+    }
+  ]
+}
