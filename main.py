@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 import urllib.parse
 import uuid
@@ -219,6 +220,39 @@ class ServerRegistry:
                 for s in data.get("servers", []):
                     self._servers[s["id"]] = s
                 logger.info("Загружено серверов: %d", len(self._servers))
+            except json.JSONDecodeError as e:
+                logger.error(
+                    "Ошибка загрузки %s: %s (строка %s, столбец %s)",
+                    SERVERS_FILE,
+                    e.msg,
+                    e.lineno,
+                    e.colno,
+                )
+                try:
+                    with open(SERVERS_FILE, encoding="utf-8") as f:
+                        lines = f.readlines()
+                    if e.lineno and 1 <= e.lineno <= len(lines):
+                        bad = lines[e.lineno - 1].rstrip()
+                        logger.error("  проблемная строка %s: %s", e.lineno, bad)
+                        if e.lineno >= 2:
+                            logger.error("  выше: %s", lines[e.lineno - 2].rstrip())
+                except OSError:
+                    pass
+                logger.error(
+                    "Проверьте JSON: запятые между полями, без запятой перед } и ], "
+                    "без комментариев // и #. Команда: python -m json.tool %s",
+                    SERVERS_FILE,
+                )
+                bak = f"{SERVERS_FILE}.broken.{datetime.now():%Y%m%d_%H%M%S}"
+                try:
+                    shutil.move(SERVERS_FILE, bak)
+                    logger.warning(
+                        "Повреждённый %s переименован в %s — при необходимости исправьте и верните имя",
+                        SERVERS_FILE,
+                        bak,
+                    )
+                except OSError as oe:
+                    logger.error("Не удалось сохранить копию повреждённого файла: %s", oe)
             except Exception as e:
                 logger.error("Ошибка загрузки %s: %s", SERVERS_FILE, e)
 
