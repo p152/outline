@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import ssl
 import urllib.parse
+import uuid
 from datetime import datetime
 from functools import wraps
 from logging.handlers import RotatingFileHandler
@@ -60,55 +62,53 @@ def _require(name: str) -> str:
 
 class Config:
     BOT_TOKEN: str = _require("BOT_TOKEN")
-    OUTLINE_URL: str = _require("OUTLINE_API_URL").rstrip("/")
+    # OUTLINE_API_URL используется только при первом запуске для миграции в servers.json
+    OUTLINE_URL: str = os.getenv("OUTLINE_API_URL", "").strip().rstrip("/")
     ADMINS: list[int] = [
         int(x.strip())
         for x in _require("ALLOWED_IDS").split(",")
         if x.strip().isdigit()
     ]
     CERT_FILE: str = "outline_cert.pem"
-    # Префикс для автоимени при быстром создании ключа. Меняется через бот (до перезапуска).
     KEY_PREFIX: str = os.getenv("KEY_PREFIX", "Key").strip() or "Key"
 
 
 # ── Outline API ───────────────────────────────────────────────────────────────
 
 class OutlineAPI:
-    _session: Optional[aiohttp.ClientSession] = None
+    def __init__(self, url: str, cert_file: Optional[str] = None):
+        self.url = url.rstrip("/")
+        self._cert_file = cert_file or Config.CERT_FILE
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    @classmethod
-    def _make_ssl(cls) -> ssl.SSLContext | bool:
-        if os.path.exists(Config.CERT_FILE):
-            ctx = ssl.create_default_context(cafile=Config.CERT_FILE)
-            # Outline использует certificate pinning без привязки к hostname/IP.
+    def _make_ssl(self) -> ssl.SSLContext | bool:
+        if os.path.exists(self._cert_file):
+            ctx = ssl.create_default_context(cafile=self._cert_file)
             ctx.check_hostname = False
-            logger.info("SSL: используется %s", Config.CERT_FILE)
+            logger.info("SSL: используется %s", self._cert_file)
             return ctx
-        logger.warning("outline_cert.pem не найден — SSL-верификация ОТКЛЮЧЕНА")
+        logger.warning("%s не найден — SSL-верификация ОТКЛЮЧЕНА", self._cert_file)
         return False
 
-    @classmethod
-    async def start(cls) -> None:
-        cls._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=cls._make_ssl()),
-            timeout=aiohttp.ClientTimeout(total=10),
-        )
+    async def _ensure_session(self) -> None:
+        if not self._session:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=self._make_ssl()),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
 
-    @classmethod
-    async def stop(cls) -> None:
-        if cls._session:
-            await cls._session.close()
-            cls._session = None
+    async def close(self) -> None:
+        if self._session:
+            await self._session.close()
+            self._session = None
 
-    @classmethod
     async def _req(
-        cls, method: str, endpoint: str, **kwargs
+        self, method: str, endpoint: str, **kwargs
     ) -> Optional[dict | bool]:
-        if not cls._session:
-            raise RuntimeError("Сессия не инициализирована — вызовите OutlineAPI.start()")
-        url = f"{Config.OUTLINE_URL}/{endpoint}"
+        await self._ensure_session()
+        url = f"{self.url}/{endpoint}"
         try:
-            async with cls._session.request(method, url, **kwargs) as r:
+            async with self._session.request(method, url, **kwargs) as r:
                 logger.debug("%s %s → %d", method, url, r.status)
                 if r.status == 204:
                     return True
@@ -122,17 +122,14 @@ class OutlineAPI:
 
     # -- Keys ------------------------------------------------------------------
 
-    @classmethod
-    async def list_keys(cls) -> Optional[dict]:
-        return await cls._req("GET", "access-keys")
+    async def list_keys(self) -> Optional[dict]:
+        return await self._req("GET", "access-keys")
 
-    @classmethod
-    async def get_key(cls, key_id: str) -> Optional[dict]:
-        return await cls._req("GET", f"access-keys/{key_id}")
+    async def get_key(self, key_id: str) -> Optional[dict]:
+        return await self._req("GET", f"access-keys/{key_id}")
 
-    @classmethod
     async def create_key(
-        cls,
+        self,
         name: Optional[str] = None,
         limit_gb: Optional[float] = None,
     ) -> Optional[dict]:
@@ -141,73 +138,146 @@ class OutlineAPI:
             body["name"] = name
         if limit_gb:
             body["limit"] = {"bytes": int(limit_gb * 1024 ** 3)}
-        return await cls._req("POST", "access-keys", json=body or None)
+        return await self._req("POST", "access-keys", json=body or None)
 
-    @classmethod
-    async def delete_key(cls, key_id: str) -> bool:
-        return await cls._req("DELETE", f"access-keys/{key_id}") is not None
+    async def delete_key(self, key_id: str) -> bool:
+        return await self._req("DELETE", f"access-keys/{key_id}") is not None
 
-    @classmethod
-    async def rename_key(cls, key_id: str, name: str) -> bool:
-        return await cls._req(
+    async def rename_key(self, key_id: str, name: str) -> bool:
+        return await self._req(
             "PUT", f"access-keys/{key_id}/name", data={"name": name}
         ) is not None
 
-    @classmethod
-    async def set_limit(cls, key_id: str, gb: float) -> bool:
-        return await cls._req(
+    async def set_limit(self, key_id: str, gb: float) -> bool:
+        return await self._req(
             "PUT",
             f"access-keys/{key_id}/data-limit",
             json={"limit": {"bytes": int(gb * 1024 ** 3)}},
         ) is not None
 
-    @classmethod
-    async def remove_limit(cls, key_id: str) -> bool:
-        return await cls._req("DELETE", f"access-keys/{key_id}/data-limit") is not None
+    async def remove_limit(self, key_id: str) -> bool:
+        return await self._req("DELETE", f"access-keys/{key_id}/data-limit") is not None
 
     # -- Server ----------------------------------------------------------------
 
-    @classmethod
-    async def server_info(cls) -> Optional[dict]:
-        return await cls._req("GET", "server")
+    async def server_info(self) -> Optional[dict]:
+        return await self._req("GET", "server")
 
-    @classmethod
-    async def transfer_stats(cls) -> Optional[dict]:
-        return await cls._req("GET", "metrics/transfer")
+    async def transfer_stats(self) -> Optional[dict]:
+        return await self._req("GET", "metrics/transfer")
 
-    @classmethod
-    async def set_server_name(cls, name: str) -> bool:
-        return await cls._req("PUT", "server/name", json={"name": name}) is not None
+    async def set_server_name(self, name: str) -> bool:
+        return await self._req("PUT", "server/name", json={"name": name}) is not None
 
-    @classmethod
-    async def set_server_hostname(cls, hostname: str) -> bool:
-        return await cls._req(
+    async def set_server_hostname(self, hostname: str) -> bool:
+        return await self._req(
             "PUT", "server/hostname-for-access-keys", json={"hostname": hostname}
         ) is not None
 
-    @classmethod
-    async def set_server_port(cls, port: int) -> bool:
-        return await cls._req(
+    async def set_server_port(self, port: int) -> bool:
+        return await self._req(
             "PUT", "server/port-for-new-access-keys", json={"port": port}
         ) is not None
 
-    @classmethod
-    async def set_global_limit(cls, gb: float) -> bool:
-        return await cls._req(
+    async def set_global_limit(self, gb: float) -> bool:
+        return await self._req(
             "PUT",
             "server/access-key-data-limit",
             json={"limit": {"bytes": int(gb * 1024 ** 3)}},
         ) is not None
 
-    @classmethod
-    async def remove_global_limit(cls) -> bool:
-        return await cls._req("DELETE", "server/access-key-data-limit") is not None
+    async def remove_global_limit(self) -> bool:
+        return await self._req("DELETE", "server/access-key-data-limit") is not None
 
-    @classmethod
-    async def set_metrics_enabled(cls, enabled: bool) -> bool:
-        return await cls._req(
+    async def set_metrics_enabled(self, enabled: bool) -> bool:
+        return await self._req(
             "PUT", "metrics/enabled", json={"metricsEnabled": enabled}
         ) is not None
+
+
+# ── Server Registry ───────────────────────────────────────────────────────────
+
+SERVERS_FILE = "servers.json"
+
+
+class ServerRegistry:
+    """Хранит список серверов в servers.json и управляет их API-экземплярами."""
+
+    def __init__(self):
+        self._servers: dict[str, dict] = {}
+        self._apis: dict[str, OutlineAPI] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if os.path.exists(SERVERS_FILE):
+            try:
+                with open(SERVERS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                for s in data.get("servers", []):
+                    self._servers[s["id"]] = s
+                logger.info("Загружено серверов: %d", len(self._servers))
+            except Exception as e:
+                logger.error("Ошибка загрузки %s: %s", SERVERS_FILE, e)
+
+        # Миграция из .env при первом запуске
+        if not self._servers and Config.OUTLINE_URL:
+            srv_id = "default"
+            self._servers[srv_id] = {
+                "id": srv_id,
+                "name": "Outline Server",
+                "url": Config.OUTLINE_URL,
+            }
+            self._save()
+            logger.info("Сервер мигрирован из OUTLINE_API_URL → %s", SERVERS_FILE)
+
+    def _save(self) -> None:
+        with open(SERVERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"servers": list(self._servers.values())},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+    def add(self, name: str, url: str) -> str:
+        srv_id = uuid.uuid4().hex[:8]
+        self._servers[srv_id] = {"id": srv_id, "name": name, "url": url}
+        self._save()
+        logger.info("Добавлен сервер: %s (%s)", name, srv_id)
+        return srv_id
+
+    def remove(self, srv_id: str) -> bool:
+        if srv_id not in self._servers:
+            return False
+        name = self._servers[srv_id].get("name", srv_id)
+        del self._servers[srv_id]
+        if srv_id in self._apis:
+            del self._apis[srv_id]
+        self._save()
+        logger.info("Удалён сервер: %s (%s)", name, srv_id)
+        return True
+
+    def list(self) -> list[dict]:
+        return list(self._servers.values())
+
+    def get(self, srv_id: str) -> Optional[dict]:
+        return self._servers.get(srv_id)
+
+    def get_api(self, srv_id: str) -> Optional[OutlineAPI]:
+        if srv_id not in self._servers:
+            return None
+        if srv_id not in self._apis:
+            s = self._servers[srv_id]
+            self._apis[srv_id] = OutlineAPI(s["url"])
+        return self._apis[srv_id]
+
+    async def stop_all(self) -> None:
+        for api in self._apis.values():
+            await api.close()
+        self._apis.clear()
+
+
+registry = ServerRegistry()
 
 
 # ── Bot & FSM ─────────────────────────────────────────────────────────────────
@@ -222,13 +292,16 @@ class States(StatesGroup):
     setting_limit = State()
     creating_name = State()
     creating_limit = State()
-    # Сервер
+    # Настройки сервера
     server_name = State()
     server_hostname = State()
     server_port = State()
     server_global_limit = State()
     server_prefix = State()
     prefix_custom = State()
+    # Добавление нового сервера
+    adding_server_url = State()
+    adding_server_name = State()
 
 
 # Пресеты префиксов: имитация TLS-заголовка для обхода DPI
@@ -248,10 +321,7 @@ def _full_access_url(key: dict) -> str:
 
 
 def _make_prefixed_url(access_url: str, prefix_bytes: bytes, keep_name: bool = True) -> str:
-    """Вставляет параметр prefix= в ss:// ссылку.
-    keep_name=True  → сохраняет #name (клиент показывает имя ключа)
-    keep_name=False → убирает #name (клиент показывает имя сервера по умолчанию)
-    """
+    """Вставляет параметр prefix= в ss:// ссылку."""
     encoded = urllib.parse.quote(prefix_bytes, safe="")
     base, _, fragment = access_url.partition("#")
     sep = "&" if "?" in base else "?"
@@ -268,6 +338,26 @@ def _next_autoname(keys: list[dict]) -> str:
     while n in used:
         n += 1
     return f"{prefix} #{n}"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _reset_state(state: FSMContext) -> None:
+    """Сбрасывает FSM-состояние, сохраняя выбранный server_id."""
+    data = await state.get_data()
+    server_id = data.get("server_id")
+    await state.clear()
+    if server_id:
+        await state.update_data(server_id=server_id)
+
+
+async def _get_api(state: FSMContext) -> Optional[OutlineAPI]:
+    """Возвращает OutlineAPI для активного сервера из FSM-данных."""
+    data = await state.get_data()
+    srv_id = data.get("server_id")
+    if not srv_id:
+        return None
+    return registry.get_api(srv_id)
 
 
 # ── Access control ────────────────────────────────────────────────────────────
@@ -287,6 +377,21 @@ def admin_only(func):
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
+def kb_server_list(servers: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"🖥 {s['name']}", callback_data=f"select_server:{s['id']}")]
+        for s in servers
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Добавить сервер", callback_data="add_server")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_no_servers() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➕ Добавить сервер", callback_data="add_server"),
+    ]])
+
+
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -296,6 +401,9 @@ def kb_main() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
             InlineKeyboardButton(text="⚙️ Сервер", callback_data="server_menu"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Сменить сервер", callback_data="server_list"),
         ],
     ])
 
@@ -357,7 +465,7 @@ def kb_cancel(back: str = "main_menu") -> InlineKeyboardMarkup:
     ]])
 
 
-def kb_server(metrics_enabled: bool) -> InlineKeyboardMarkup:
+def kb_server(metrics_enabled: bool, srv_id: str) -> InlineKeyboardMarkup:
     metrics_label = "📶 Метрики: выключить" if metrics_enabled else "📶 Метрики: включить"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Название сервера", callback_data="srv_rename")],
@@ -366,6 +474,7 @@ def kb_server(metrics_enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🌍 Глобальный лимит", callback_data="srv_global_limit")],
         [InlineKeyboardButton(text=f"🏷 Префикс ключей: {Config.KEY_PREFIX}", callback_data="srv_prefix")],
         [InlineKeyboardButton(text=metrics_label, callback_data="srv_toggle_metrics")],
+        [InlineKeyboardButton(text="🗑 Удалить сервер", callback_data=f"del_server_confirm:{srv_id}")],
         [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")],
     ])
 
@@ -386,6 +495,13 @@ def kb_global_limit(has_limit: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def kb_confirm_del_server(srv_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"del_server_do:{srv_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="server_menu"),
+    ]])
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 def fmt_bytes(b: int | None) -> str:
@@ -394,7 +510,6 @@ def fmt_bytes(b: int | None) -> str:
     value = float(b)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024:
-            # Целые числа без дроби, дробные — с одним знаком
             formatted = f"{value:.0f}" if value == int(value) else f"{value:.1f}"
             return f"{formatted} {unit}"
         value /= 1024
@@ -424,24 +539,208 @@ def fmt_key(key: dict, used_bytes: int | None = None) -> str:
     return "\n".join(lines)
 
 
-# ── Handlers: main menu ───────────────────────────────────────────────────────
+# ── Handlers: server selection ────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 @admin_only
-async def cmd_start(msg: Message):
-    await msg.answer(
-        "🔐 <b>Outline VPN — управление</b>",
+async def cmd_start(msg: Message, state: FSMContext):
+    await state.clear()
+    servers = registry.list()
+    if not servers:
+        await msg.answer(
+            "🔐 <b>Outline VPN — управление</b>\n\nСерверов не добавлено. Добавьте первый сервер:",
+            reply_markup=kb_no_servers(),
+            parse_mode="HTML",
+        )
+    else:
+        await msg.answer(
+            "🔐 <b>Outline VPN — управление</b>\n\nВыберите сервер:",
+            reply_markup=kb_server_list(servers),
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(F.data == "server_list")
+@admin_only
+async def cb_server_list(cb: CallbackQuery, state: FSMContext):
+    await _reset_state(state)
+    servers = registry.list()
+    if not servers:
+        await cb.message.edit_text(
+            "🔐 <b>Outline VPN — управление</b>\n\nСерверов не добавлено. Добавьте первый сервер:",
+            reply_markup=kb_no_servers(),
+            parse_mode="HTML",
+        )
+    else:
+        await cb.message.edit_text(
+            "🔐 <b>Outline VPN — управление</b>\n\nВыберите сервер:",
+            reply_markup=kb_server_list(servers),
+            parse_mode="HTML",
+        )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("select_server:"))
+@admin_only
+async def cb_select_server(cb: CallbackQuery, state: FSMContext):
+    srv_id = cb.data.split(":", 1)[1]
+    srv = registry.get(srv_id)
+    if not srv:
+        await cb.answer("❌ Сервер не найден", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(server_id=srv_id)
+    await cb.message.edit_text(
+        f"🔐 <b>Outline VPN — {srv['name']}</b>",
         reply_markup=kb_main(),
         parse_mode="HTML",
     )
+    await cb.answer()
 
+
+# ── Handlers: add server ──────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "add_server")
+@admin_only
+async def cb_add_server(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(States.adding_server_url)
+    await cb.message.edit_text(
+        "➕ <b>Добавление сервера</b>\n\n"
+        "Введите <b>Management API URL</b> сервера.\n"
+        "Найти можно в Outline Manager → ⚙️ → скопировать строку подключения:",
+        parse_mode="HTML",
+        reply_markup=kb_cancel("server_list"),
+    )
+    await cb.answer()
+
+
+@dp.message(States.adding_server_url)
+@admin_only
+async def fsm_adding_server_url(msg: Message, state: FSMContext):
+    url = msg.text.strip()
+    if not url.startswith(("http://", "https://")):
+        await msg.answer(
+            "❌ Некорректный URL. Должен начинаться с <code>https://</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    await state.update_data(new_server_url=url)
+    await state.set_state(States.adding_server_name)
+
+    # Пробуем получить имя сервера из API
+    hint = ""
+    try:
+        tmp_api = OutlineAPI(url)
+        info = await tmp_api.server_info()
+        await tmp_api.close()
+        if info and info.get("name"):
+            hint = f"\n\n💡 Имя из API: <code>{info['name']}</code>"
+    except Exception:
+        pass
+
+    await msg.answer(
+        f"✏️ Введите название сервера (для отображения в боте):{hint}",
+        parse_mode="HTML",
+        reply_markup=kb_cancel("server_list"),
+    )
+
+
+@dp.message(States.adding_server_name)
+@admin_only
+async def fsm_adding_server_name(msg: Message, state: FSMContext):
+    name = msg.text.strip()
+    if not name:
+        await msg.answer("❌ Название не может быть пустым")
+        return
+    if len(name) > 64:
+        await msg.answer("❌ Название не может быть длиннее 64 символов")
+        return
+
+    st_data = await state.get_data()
+    url = st_data.get("new_server_url")
+    if not url:
+        await state.clear()
+        await msg.answer("❌ Ошибка: URL не найден. Начните заново.", reply_markup=kb_no_servers())
+        return
+
+    srv_id = registry.add(name, url)
+    await state.clear()
+    await state.update_data(server_id=srv_id)
+    await msg.answer(
+        f"✅ <b>Сервер добавлен!</b>\n🖥 {name}",
+        parse_mode="HTML",
+        reply_markup=kb_main(),
+    )
+
+
+# ── Handlers: delete server ───────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("del_server_confirm:"))
+@admin_only
+async def cb_del_server_confirm(cb: CallbackQuery):
+    srv_id = cb.data.split(":", 1)[1]
+    srv = registry.get(srv_id)
+    if not srv:
+        await cb.answer("❌ Сервер не найден", show_alert=True)
+        return
+    await cb.message.edit_text(
+        f"⚠️ <b>Удалить сервер?</b>\n\n🖥 {srv['name']}\n\nДействие необратимо.",
+        reply_markup=kb_confirm_del_server(srv_id),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("del_server_do:"))
+@admin_only
+async def cb_del_server_do(cb: CallbackQuery, state: FSMContext):
+    srv_id = cb.data.split(":", 1)[1]
+    srv = registry.get(srv_id)
+    name = srv["name"] if srv else srv_id
+    registry.remove(srv_id)
+
+    st_data = await state.get_data()
+    if st_data.get("server_id") == srv_id:
+        await state.clear()
+
+    servers = registry.list()
+    if not servers:
+        await cb.message.edit_text(
+            f"✅ Сервер <b>{name}</b> удалён.\n\nСерверов не осталось. Добавьте новый:",
+            reply_markup=kb_no_servers(),
+            parse_mode="HTML",
+        )
+    else:
+        await cb.message.edit_text(
+            f"✅ Сервер <b>{name}</b> удалён.\n\nВыберите сервер:",
+            reply_markup=kb_server_list(servers),
+            parse_mode="HTML",
+        )
+    await cb.answer()
+
+
+# ── Handlers: main menu ───────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "main_menu")
 @admin_only
 async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
+    await _reset_state(state)
+    st_data = await state.get_data()
+    srv_id = st_data.get("server_id")
+    if not srv_id:
+        servers = registry.list()
+        await cb.message.edit_text(
+            "🔐 <b>Outline VPN — управление</b>\n\nВыберите сервер:",
+            reply_markup=kb_server_list(servers) if servers else kb_no_servers(),
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        return
+    srv = registry.get(srv_id)
+    title = srv["name"] if srv else "Outline VPN"
     await cb.message.edit_text(
-        "🔐 <b>Outline VPN — управление</b>",
+        f"🔐 <b>Outline VPN — {title}</b>",
         reply_markup=kb_main(),
         parse_mode="HTML",
     )
@@ -453,15 +752,19 @@ async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "list_keys")
 @admin_only
 async def cb_list_keys(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    data = await OutlineAPI.list_keys()
-    if not data or not data.get("accessKeys"):
+    await _reset_state(state)
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    keys_data = await api.list_keys()
+    if not keys_data or not keys_data.get("accessKeys"):
         await cb.message.edit_text("❌ Ключей нет", reply_markup=kb_back())
         await cb.answer()
         return
 
     builder = InlineKeyboardBuilder()
-    for key in data["accessKeys"]:
+    for key in keys_data["accessKeys"]:
         builder.button(
             text=key.get("name") or f"Ключ {key['id']}",
             callback_data=f"key:{key['id']}",
@@ -479,11 +782,15 @@ async def cb_list_keys(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("key:"))
 @admin_only
-async def cb_key_info(cb: CallbackQuery):
+async def cb_key_info(cb: CallbackQuery, state: FSMContext):
     key_id = cb.data.split(":", 1)[1]
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
     key, stats = await asyncio.gather(
-        OutlineAPI.get_key(key_id),
-        OutlineAPI.transfer_stats(),
+        api.get_key(key_id),
+        api.transfer_stats(),
     )
     if not key:
         await cb.answer("❌ Ключ не найден", show_alert=True)
@@ -518,12 +825,16 @@ async def cb_create_menu(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "create_quick")
 @admin_only
-async def cb_create_quick(cb: CallbackQuery):
-    existing = await OutlineAPI.list_keys()
+async def cb_create_quick(cb: CallbackQuery, state: FSMContext):
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    existing = await api.list_keys()
     existing_list = existing.get("accessKeys", []) if existing else []
     auto_name = _next_autoname(existing_list)
 
-    key = await OutlineAPI.create_key(name=auto_name)
+    key = await api.create_key(name=auto_name)
     if not key or "id" not in key:
         await cb.message.edit_text("❌ Ошибка создания ключа", reply_markup=kb_back())
         await cb.answer()
@@ -575,11 +886,16 @@ async def fsm_creating_limit(msg: Message, state: FSMContext):
         await msg.answer("❌ Введите число, например <code>5.5</code>", parse_mode="HTML")
         return
 
-    data = await state.get_data()
-    await state.clear()
+    st_data = await state.get_data()
+    api = await _get_api(state)
+    await _reset_state(state)
 
-    key = await OutlineAPI.create_key(
-        name=data.get("name"),
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+
+    key = await api.create_key(
+        name=st_data.get("name"),
         limit_gb=gb if gb > 0 else None,
     )
     if not key or "id" not in key:
@@ -616,9 +932,13 @@ async def fsm_rename(msg: Message, state: FSMContext):
     if not name:
         await msg.answer("❌ Имя не может быть пустым")
         return
-    data = await state.get_data()
-    await state.clear()
-    ok = await OutlineAPI.rename_key(data["key_id"], name)
+    st_data = await state.get_data()
+    api = await _get_api(state)
+    await _reset_state(state)
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+    ok = await api.rename_key(st_data["key_id"], name)
     if ok:
         await msg.answer(
             f"✅ Ключ переименован в <b>{name}</b>",
@@ -657,14 +977,19 @@ async def fsm_set_limit(msg: Message, state: FSMContext):
         await msg.answer("❌ Введите число, например <code>5.5</code>", parse_mode="HTML")
         return
 
-    data = await state.get_data()
-    await state.clear()
+    st_data = await state.get_data()
+    api = await _get_api(state)
+    await _reset_state(state)
+
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
 
     if gb == 0:
-        ok = await OutlineAPI.remove_limit(data["key_id"])
+        ok = await api.remove_limit(st_data["key_id"])
         text = "✅ Лимит снят" if ok else "❌ Не удалось снять лимит"
     else:
-        ok = await OutlineAPI.set_limit(data["key_id"], gb)
+        ok = await api.set_limit(st_data["key_id"], gb)
         text = f"✅ Лимит установлен: {gb} GB" if ok else "❌ Не удалось установить лимит"
 
     await msg.answer(text, reply_markup=kb_main())
@@ -686,9 +1011,13 @@ async def cb_confirm_del(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete:"))
 @admin_only
-async def cb_delete(cb: CallbackQuery):
+async def cb_delete(cb: CallbackQuery, state: FSMContext):
     key_id = cb.data.split(":", 1)[1]
-    ok = await OutlineAPI.delete_key(key_id)
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    ok = await api.delete_key(key_id)
     if ok:
         await cb.message.edit_text(f"✅ Ключ {key_id} удалён", reply_markup=kb_main())
     else:
@@ -702,11 +1031,15 @@ async def cb_delete(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "stats")
 @admin_only
-async def cb_stats(cb: CallbackQuery):
+async def cb_stats(cb: CallbackQuery, state: FSMContext):
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
     server, stats, keys_data = await asyncio.gather(
-        OutlineAPI.server_info(),
-        OutlineAPI.transfer_stats(),
-        OutlineAPI.list_keys(),
+        api.server_info(),
+        api.transfer_stats(),
+        api.list_keys(),
     )
 
     key_names: dict[str, str] = {}
@@ -749,8 +1082,15 @@ async def cb_stats(cb: CallbackQuery):
 @dp.callback_query(F.data == "server_menu")
 @admin_only
 async def cb_server_menu(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    server = await OutlineAPI.server_info()
+    await _reset_state(state)
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    st_data = await state.get_data()
+    srv_id = st_data.get("server_id", "")
+
+    server = await api.server_info()
     if not server:
         await cb.message.edit_text("❌ Не удалось получить данные сервера", reply_markup=kb_back())
         await cb.answer()
@@ -772,7 +1112,7 @@ async def cb_server_menu(cb: CallbackQuery, state: FSMContext):
 
     await cb.message.edit_text(
         "\n".join(lines),
-        reply_markup=kb_server(metrics_enabled),
+        reply_markup=kb_server(metrics_enabled, srv_id),
         parse_mode="HTML",
     )
     await cb.answer()
@@ -798,8 +1138,12 @@ async def fsm_server_name(msg: Message, state: FSMContext):
     if not name:
         await msg.answer("❌ Название не может быть пустым")
         return
-    await state.clear()
-    ok = await OutlineAPI.set_server_name(name)
+    api = await _get_api(state)
+    await _reset_state(state)
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+    ok = await api.set_server_name(name)
     text = f"✅ Сервер переименован в <b>{name}</b>" if ok else "❌ Ошибка переименования"
     await msg.answer(text, parse_mode="HTML", reply_markup=kb_main())
 
@@ -824,8 +1168,12 @@ async def fsm_server_hostname(msg: Message, state: FSMContext):
     if not hostname:
         await msg.answer("❌ Hostname не может быть пустым")
         return
-    await state.clear()
-    ok = await OutlineAPI.set_server_hostname(hostname)
+    api = await _get_api(state)
+    await _reset_state(state)
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+    ok = await api.set_server_hostname(hostname)
     text = f"✅ Hostname изменён на <code>{hostname}</code>" if ok else "❌ Ошибка изменения hostname"
     await msg.answer(text, parse_mode="HTML", reply_markup=kb_main())
 
@@ -854,8 +1202,12 @@ async def fsm_server_port(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ Введите целое число, например <code>1496</code>", parse_mode="HTML")
         return
-    await state.clear()
-    ok = await OutlineAPI.set_server_port(port)
+    api = await _get_api(state)
+    await _reset_state(state)
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+    ok = await api.set_server_port(port)
     text = f"✅ Порт для новых ключей изменён на <code>{port}</code>" if ok else "❌ Ошибка изменения порта"
     await msg.answer(text, parse_mode="HTML", reply_markup=kb_main())
 
@@ -864,8 +1216,12 @@ async def fsm_server_port(msg: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "srv_global_limit")
 @admin_only
-async def cb_srv_global_limit(cb: CallbackQuery):
-    server = await OutlineAPI.server_info()
+async def cb_srv_global_limit(cb: CallbackQuery, state: FSMContext):
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    server = await api.server_info()
     global_limit = server.get("accessKeyDataLimit") if server else None
     current = fmt_bytes(global_limit["bytes"]) if global_limit else "♾️ нет"
 
@@ -880,9 +1236,13 @@ async def cb_srv_global_limit(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("srv_glimit_set:"))
 @admin_only
-async def cb_srv_glimit_set(cb: CallbackQuery):
+async def cb_srv_glimit_set(cb: CallbackQuery, state: FSMContext):
     gb = float(cb.data.split(":", 1)[1])
-    ok = await OutlineAPI.set_global_limit(gb)
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    ok = await api.set_global_limit(gb)
     text = f"✅ Глобальный лимит установлен: {gb:.0f} GB" if ok else "❌ Ошибка установки лимита"
     await cb.message.edit_text(text, reply_markup=kb_back())
     await cb.answer()
@@ -911,16 +1271,24 @@ async def fsm_server_global_limit(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ Введите число, например <code>10.5</code>", parse_mode="HTML")
         return
-    await state.clear()
-    ok = await OutlineAPI.set_global_limit(gb)
+    api = await _get_api(state)
+    await _reset_state(state)
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+    ok = await api.set_global_limit(gb)
     text = f"✅ Глобальный лимит установлен: {gb} GB" if ok else "❌ Ошибка установки лимита"
     await msg.answer(text, reply_markup=kb_main())
 
 
 @dp.callback_query(F.data == "srv_glimit_remove")
 @admin_only
-async def cb_srv_glimit_remove(cb: CallbackQuery):
-    ok = await OutlineAPI.remove_global_limit()
+async def cb_srv_glimit_remove(cb: CallbackQuery, state: FSMContext):
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    ok = await api.remove_global_limit()
     text = "✅ Глобальный лимит снят" if ok else "❌ Ошибка снятия лимита"
     await cb.message.edit_text(text, reply_markup=kb_back())
     await cb.answer()
@@ -931,18 +1299,21 @@ async def cb_srv_glimit_remove(cb: CallbackQuery):
 @dp.callback_query(F.data == "srv_toggle_metrics")
 @admin_only
 async def cb_toggle_metrics(cb: CallbackQuery, state: FSMContext):
-    server = await OutlineAPI.server_info()
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    server = await api.server_info()
     if not server:
         await cb.answer("❌ Не удалось получить данные сервера", show_alert=True)
         return
     current = server.get("metricsEnabled", False)
-    ok = await OutlineAPI.set_metrics_enabled(not current)
+    ok = await api.set_metrics_enabled(not current)
     if ok:
         state_str = "включены" if not current else "выключены"
         await cb.answer(f"✅ Метрики {state_str}", show_alert=True)
     else:
         await cb.answer("❌ Ошибка изменения метрик", show_alert=True)
-    # Обновляем страницу настроек
     await cb_server_menu(cb, state)
 
 
@@ -956,7 +1327,6 @@ def _fmt_prefix_result(access_url: str, prefix_bytes: bytes, label: str) -> str:
 
     lines = [f"🔀 <b>Ссылка с DPI-префиксом {label}</b>", ""]
 
-    # Показываем ссылку без имени только если оригинал содержал имя
     if url_named != url_clean:
         lines += [
             "👤 <b>Для клиента — без имени ключа</b>",
@@ -975,6 +1345,7 @@ def _fmt_prefix_result(access_url: str, prefix_bytes: bytes, label: str) -> str:
     lines += ["", f"🔬 Байты: <code>{hex_str}</code>"]
     return "\n".join(lines)
 
+
 @dp.callback_query(F.data.startswith("prefix_menu:"))
 @admin_only
 async def cb_prefix_menu(cb: CallbackQuery):
@@ -992,14 +1363,18 @@ async def cb_prefix_menu(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pfx:"))
 @admin_only
-async def cb_prefix_apply(cb: CallbackQuery):
+async def cb_prefix_apply(cb: CallbackQuery, state: FSMContext):
     _, key_id, preset = cb.data.split(":", 2)
     if preset not in PREFIX_PRESETS:
         await cb.answer("❌ Неизвестный пресет", show_alert=True)
         return
 
     prefix_bytes, label = PREFIX_PRESETS[preset]
-    key = await OutlineAPI.get_key(key_id)
+    api = await _get_api(state)
+    if not api:
+        await cb.answer("❌ Сервер не выбран", show_alert=True)
+        return
+    key = await api.get_key(key_id)
     if not key or not key.get("accessUrl"):
         await cb.answer("❌ Не удалось получить ключ", show_alert=True)
         return
@@ -1045,10 +1420,15 @@ async def fsm_prefix_custom(msg: Message, state: FSMContext):
         )
         return
 
-    data = await state.get_data()
-    await state.clear()
+    st_data = await state.get_data()
+    api = await _get_api(state)
+    await _reset_state(state)
 
-    key = await OutlineAPI.get_key(data["key_id"])
+    if not api:
+        await msg.answer("❌ Сервер не выбран", reply_markup=kb_main())
+        return
+
+    key = await api.get_key(st_data["key_id"])
     if not key or not key.get("accessUrl"):
         await msg.answer("❌ Не удалось получить ключ", reply_markup=kb_main())
         return
@@ -1056,7 +1436,7 @@ async def fsm_prefix_custom(msg: Message, state: FSMContext):
     await msg.answer(
         _fmt_prefix_result(_full_access_url(key), prefix_bytes, "custom"),
         parse_mode="HTML",
-        reply_markup=kb_key(data["key_id"]),
+        reply_markup=kb_key(st_data["key_id"]),
     )
 
 
@@ -1086,7 +1466,7 @@ async def fsm_server_prefix(msg: Message, state: FSMContext):
     if len(prefix) > 32:
         await msg.answer("❌ Префикс не может быть длиннее 32 символов")
         return
-    await state.clear()
+    await _reset_state(state)
     Config.KEY_PREFIX = prefix
     await msg.answer(
         f"✅ Префикс изменён на <code>{prefix}</code>\n"
@@ -1109,11 +1489,10 @@ async def on_error(event: types.ErrorEvent):
 
 async def main():
     logger.info("Запуск бота (admins: %s)", Config.ADMINS)
-    await OutlineAPI.start()
     try:
         await dp.start_polling(bot)
     finally:
-        await OutlineAPI.stop()
+        await registry.stop_all()
         await bot.session.close()
         logger.info("Бот остановлен")
 
